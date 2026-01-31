@@ -1,17 +1,21 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+import json
+import asyncio
 
 # Import our Clean Modules
 from app.models.schemas import QueryRequest, AIResponse, Citation
 from app.services.librarian import librarian_service
-from app.services.brain import brain_service
+# New Agent Orchestrator
+from app.agent.orchestrator import process_user_query_stream
 
 app = FastAPI(title="Vachanamrut AI API")
 
 origins = [
     "http://localhost:5173",  
-    "http://127.0.0.1:5173",    # <--- Add this
-    "*"                         # <--- Add this TEMPORARILY to debug               # For local development   # <--- YOUR RENDER FRONTEND URL
+    "http://127.0.0.1:5173",
+    "*"
 ]
 
 app.add_middleware(
@@ -24,7 +28,7 @@ app.add_middleware(
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "modules": ["Brain", "Librarian"]}
+    return {"status": "ok", "modules": ["Agent", "Librarian", "VectorDB"]}
 
 @app.get("/vachanamrut")
 def get_vachanamrut(
@@ -37,9 +41,9 @@ def get_vachanamrut(
         raise HTTPException(status_code=404, detail="Vachanamrut not found")
     return result
 
-# --- UPDATED CHAT ENDPOINT ---
-@app.post("/ask", response_model=AIResponse)
-def ask_ai(request: QueryRequest):
+# --- AGENT STREAMING ENDPOINT ---
+@app.post("/ask")
+async def ask_ai(request: QueryRequest):
     
     # A. Check for Manual Filters (Sidebar)
     conditions = []
@@ -51,30 +55,26 @@ def ask_ai(request: QueryRequest):
     if len(conditions) == 1: manual_clause = conditions[0]
     elif len(conditions) > 1: manual_clause = {"$and": conditions}
 
-    # B. Ask the Brain (NOW PASSING HISTORY)
-    results = brain_service.search(
-        query=request.question,
-        history=request.history,  # <--- Critical Update
-        manual_filters=manual_clause
-    )
-    
-    # C. Handle Results
-    if not results['documents'] or not results['documents'][0]:
-         return AIResponse(answer="I could not find relevant information in the Vachanamrut for that request.", citations=[])
+    # Generator for Streaming
+    async def event_generator():
+        try:
+            # Use the new modular orchestrator
+            async for chunk in process_user_query_stream(
+                user_query=request.question,
+                chat_history=request.history,
+                manual_filters=manual_clause
+            ):
+                # Format: "data: {JSON}\n\n"
+                yield f"data: {json.dumps(chunk)}\n\n"
+                
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        
+        yield "data: [DONE]\n\n"
 
-    docs = results['documents'][0]
-    metas = results['metadatas'][0]
-    context_text = "\n\n".join(docs)
-
-    # D. Generate
-    system_prompt = "You are a humble spiritual assistant. Answer based strictly on the provided context."
-    user_prompt = f"Context:\n{context_text}\n\nQuestion: {request.question}"
-    
-    answer = brain_service.generate_answer(system_prompt, user_prompt)
-
-    citations = [Citation(text=d, metadata=m) for d, m in zip(docs, metas)]
-    
-    return AIResponse(answer=answer, citations=citations)
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 if __name__ == "__main__":
     import uvicorn
