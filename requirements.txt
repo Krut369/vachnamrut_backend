@@ -5,4 +5,4 @@ chromadb
 groq
 python-dotenv
 sentence-transformers
-langchain-text-splitters
+langchain-text-splittersgoogle-generativeai
